@@ -1,0 +1,15 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "hipsterbrown:pi-ai-camera",
+  "visibility": "public",
+  "url": "",
+  "description": "Modular vision service: pi-ai-camera",
+  "models": [
+    {
+      "api": "rdk:service:vision",
+      "model": "hipsterbrown:vision:pi-ai-camera"
+    }
+  ],
+  "entrypoint": "./run.sh",
+  "first_run": "./setup.sh"
+}
