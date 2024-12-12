@@ -1,5 +1,6 @@
 import asyncio
 import time
+from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Sequence
 
 from typing_extensions import Self
@@ -18,9 +19,9 @@ from viam.utils import ValueTypes, struct_to_dict
 
 from picamera2 import CompletedRequest, Picamera2
 from picamera2.devices import IMX500
-from picamera2.devices.imx500 import NetworkIntrinsics
+from picamera2.devices.imx500 import NetworkIntrinsics, postprocess_nanodet_detection
 from picamera2.devices.imx500.imx500 import FW_NETWORK_STAGE
-from picamera2.devices.imx500.postprocess import softmax
+from picamera2.devices.imx500.postprocess import softmax, scale_boxes
 
 import numpy as np
 
@@ -33,6 +34,7 @@ class PiAiCamera(Vision, EasyResource):
     )
 
     intrinsics: NetworkIntrinsics
+    picam: Picamera2 = None
 
     @classmethod
     def new(
@@ -73,19 +75,30 @@ class PiAiCamera(Vision, EasyResource):
             dependencies (Mapping[ResourceName, ResourceBase]): Any dependencies (both implicit and explicit)
         """
         attrs = struct_to_dict(config.attributes)
+        task = str(attrs.get("task", "classification"))
         model = attrs.get(
-            "model_path", "/usr/share/imx500-models/imx500_network_mobilenet_v2.rpk"
+            "model_path",
+            f"/usr/share/imx500-models/{'imx500_network_mobilenet_v2.rpk' if task == 'classification' else 'imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk'}",
         )
         inference_rate = attrs.get("inference_rate", 30)
-        use_softmax = attrs.get("softmax", None)
-        labels = str(attrs.get("labels_path", "assets/imagenet_labels.txt"))
-        task = str(attrs.get("task", "classification"))
+        postprocess = attrs.get("postprocess", None)
+        labels = str(
+            attrs.get(
+                "labels_path",
+                f"assets/{'imagenet_labels' if task == 'classification' else 'coco_labels'}.txt",
+            )
+        )
+
+        if self.picam is not None:
+            self.picam.stop()
 
         self.imx500 = IMX500(model)
         self.intrinsics = self.imx500.network_intrinsics or NetworkIntrinsics()
         self.intrinsics.task = task
-        if use_softmax:
-            self.intrinsics.softmax = use_softmax
+        if postprocess == "softmax":
+            self.intrinsics.softmax = True
+        if postprocess == "nanodet":
+            self.intrinsics.postprocess = postprocess
         self.intrinsics.inference_rate = inference_rate
 
         with open(labels, "r") as f:
@@ -146,7 +159,47 @@ class PiAiCamera(Vision, EasyResource):
     def _parse_detections_from_request(
         self, request: CompletedRequest
     ) -> List[Detection]:
-        return []
+        metadata = request.get_metadata()
+        np_outputs = self.imx500.get_outputs(metadata, add_batch=True)
+        input_w, input_h = self.imx500.get_input_size()
+        if np_outputs is None:
+            return []
+
+        if self.intrinsics.postprocess == "nanodet":
+            boxes, scores, classes = postprocess_nanodet_detection(
+                outputs=np_outputs[0], max_out=10
+            )[0]
+            boxes = scale_boxes(boxes, 1, 1, input_h, input_w, False, False)
+        else:
+            boxes, scores, classes = (
+                np_outputs[0][0],
+                np_outputs[1][0],
+                np_outputs[2][0],
+            )
+            if self.intrinsics.bbox_normalization:
+                boxes = boxes / input_h
+
+            if self.intrinsics.bbox_order == "xy":
+                boxes = boxes[:, [1, 0, 3, 2]]
+
+            boxes = np.array_split(boxes, 4, axis=1)
+            boxes = zip(*boxes)
+
+        boxes = [
+            self.imx500.convert_inference_coords(box, metadata, self.picam)
+            for box in boxes
+        ]
+        return [
+            Detection(
+                x_min=box[0],
+                y_min=box[1],
+                x_max=box[2],
+                y_max=box[3],
+                confidence=score,
+                class_name=self._get_label_for_index(int(class_idx)),
+            )
+            for box, score, class_idx in zip(boxes, scores, classes)
+        ]
 
     def _parse_classifications_from_request(
         self, request: CompletedRequest, count: int = 3
@@ -163,13 +216,24 @@ class PiAiCamera(Vision, EasyResource):
         top_indices = top_indices[np.argsort(-np_output[top_indices])]
         return [
             Classification(
-                class_name=self._get_label_for_index(index), confidence=np_output[index]
+                class_name=self._get_label_for_index(int(index)),
+                confidence=np_output[index],
             )
             for index in top_indices
         ]
 
     def _get_label_for_index(self, index: int) -> str:
-        return self.intrinsics.labels[index]
+        labels = self._get_labels()
+        return labels[index]
+
+    @lru_cache
+    def _get_labels(self) -> List[str]:
+        labels = self.intrinsics.labels
+
+        if self.intrinsics.ignore_dash_labels:
+            labels = [label for label in labels if label and label != "-"]
+
+        return labels
 
     async def get_detections_from_camera(
         self,
