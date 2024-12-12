@@ -1,25 +1,38 @@
 import asyncio
-import sys
-from typing import ClassVar, Final, List, Mapping, Optional, Sequence
+import time
+from typing import ClassVar, List, Mapping, Optional, Sequence
 
 from typing_extensions import Self
-from viam.media.video import ViamImage
+from viam.logging import getLogger
+from viam.media.video import ViamImage, CameraMimeType
+from viam.media.utils.pil import pil_to_viam_image
 from viam.module.module import Module
 from viam.proto.app.robot import ComponentConfig
 from viam.proto.common import PointCloudObject, ResourceName
-from viam.proto.service.vision import (Classification, Detection,
-                                       GetPropertiesResponse)
+from viam.proto.service.vision import Classification, Detection
 from viam.resource.base import ResourceBase
 from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model, ModelFamily
-from viam.services.vision import *
-from viam.utils import ValueTypes
+from viam.services.vision import Vision, CaptureAllResult
+from viam.utils import ValueTypes, struct_to_dict
+
+from picamera2 import CompletedRequest, Picamera2
+from picamera2.devices import IMX500
+from picamera2.devices.imx500 import NetworkIntrinsics
+from picamera2.devices.imx500.imx500 import FW_NETWORK_STAGE
+from picamera2.devices.imx500.postprocess import softmax
+
+import numpy as np
+
+LOGGER = getLogger(__name__)
 
 
 class PiAiCamera(Vision, EasyResource):
     MODEL: ClassVar[Model] = Model(
-        ModelFamily("hipsterbrown", "pi-ai-camera"), "pi-ai-camera"
+        ModelFamily("hipsterbrown", "vision"), "pi-ai-camera"
     )
+
+    intrinsics: NetworkIntrinsics
 
     @classmethod
     def new(
@@ -59,7 +72,43 @@ class PiAiCamera(Vision, EasyResource):
             config (ComponentConfig): The new configuration
             dependencies (Mapping[ResourceName, ResourceBase]): Any dependencies (both implicit and explicit)
         """
-        return super().reconfigure(config, dependencies)
+        attrs = struct_to_dict(config.attributes)
+        model = attrs.get(
+            "model_path", "/usr/share/imx500-models/imx500_network_mobilenet_v2.rpk"
+        )
+        inference_rate = attrs.get("inference_rate", 30)
+        use_softmax = attrs.get("softmax", None)
+        labels = str(attrs.get("labels_path", "assets/imagenet_labels.txt"))
+        task = str(attrs.get("task", "classification"))
+
+        self.imx500 = IMX500(model)
+        self.intrinsics = self.imx500.network_intrinsics or NetworkIntrinsics()
+        self.intrinsics.task = task
+        if use_softmax:
+            self.intrinsics.softmax = use_softmax
+        self.intrinsics.inference_rate = inference_rate
+
+        with open(labels, "r") as f:
+            self.intrinsics.labels = f.read().splitlines()
+
+        self.intrinsics.update_with_defaults()
+
+        self.picam = Picamera2(self.imx500.camera_num)
+        cam_config = self.picam.create_still_configuration(buffer_count=2)
+        self.picam.start(cam_config)
+
+        if self.intrinsics.preserve_aspect_ratio:
+            self.imx500.set_auto_aspect_ratio()
+
+        LOGGER.info("Waiting on camera firmware upload to complete")
+        while True:
+            current, total = self.imx500.get_fw_upload_progress(FW_NETWORK_STAGE)
+            if total:
+                LOGGER.info(f"{current} out of {total} bytes uploaded to camera")
+                if current > 0.95 * total:
+                    LOGGER.info("Firmware upload complete!")
+                    break
+            time.sleep(0.5)
 
     async def capture_all_from_camera(
         self,
@@ -70,17 +119,70 @@ class PiAiCamera(Vision, EasyResource):
         return_object_point_clouds: bool = False,
         *,
         extra: Optional[Mapping[str, ValueTypes]] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
     ) -> CaptureAllResult:
-        raise NotImplementedError()
+        LOGGER.info(
+            f"Processing capture request for {camera_name} with arguments: return_image ({return_image}), return_classifications ({return_classifications}), return_detections ({ return_detections})"
+        )
+        properties = await self.get_properties()
+        result = CaptureAllResult()
+        capture_request: CompletedRequest = self.picam.capture_request()
+        if return_image:
+            result.image = pil_to_viam_image(
+                capture_request.make_image("main"), CameraMimeType.JPEG
+            )
+
+        if return_detections and properties.detections_supported:
+            result.detections = self._parse_detections_from_request(capture_request)
+
+        if return_classifications and properties.classifications_supported:
+            result.classifications = self._parse_classifications_from_request(
+                capture_request, 1
+            )
+        capture_request.release()
+
+        return result
+
+    def _parse_detections_from_request(
+        self, request: CompletedRequest
+    ) -> List[Detection]:
+        return []
+
+    def _parse_classifications_from_request(
+        self, request: CompletedRequest, count: int = 3
+    ) -> List[Classification]:
+        np_outputs = self.imx500.get_outputs(request.get_metadata())
+        if np_outputs is None:
+            return []
+
+        np_output = np_outputs[0]
+        if self.intrinsics.softmax:
+            np_output = softmax(np_output)
+
+        top_indices = np.argpartition(-np_output, count)[:count]
+        top_indices = top_indices[np.argsort(-np_output[top_indices])]
+        return [
+            Classification(
+                class_name=self._get_label_for_index(index), confidence=np_output[index]
+            )
+            for index in top_indices
+        ]
+
+    def _get_label_for_index(self, index: int) -> str:
+        return self.intrinsics.labels[index]
 
     async def get_detections_from_camera(
         self,
         camera_name: str,
         *,
         extra: Optional[Mapping[str, ValueTypes]] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
     ) -> List[Detection]:
+        if self.intrinsics.task == "object detection":
+            capture_request = self.picam.capture_request()
+            detections = self._parse_detections_from_request(capture_request)
+            capture_request.release()
+            return detections
         raise NotImplementedError()
 
     async def get_detections(
@@ -88,7 +190,7 @@ class PiAiCamera(Vision, EasyResource):
         image: ViamImage,
         *,
         extra: Optional[Mapping[str, ValueTypes]] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
     ) -> List[Detection]:
         raise NotImplementedError()
 
@@ -98,8 +200,15 @@ class PiAiCamera(Vision, EasyResource):
         count: int,
         *,
         extra: Optional[Mapping[str, ValueTypes]] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
     ) -> List[Classification]:
+        if self.intrinsics.task == "classification":
+            capture_request = self.picam.capture_request()
+            classifications = self._parse_classifications_from_request(
+                capture_request, count
+            )
+            capture_request.release()
+            return classifications
         raise NotImplementedError()
 
     async def get_classifications(
@@ -108,7 +217,7 @@ class PiAiCamera(Vision, EasyResource):
         count: int,
         *,
         extra: Optional[Mapping[str, ValueTypes]] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
     ) -> List[Classification]:
         raise NotImplementedError()
 
@@ -117,7 +226,7 @@ class PiAiCamera(Vision, EasyResource):
         camera_name: str,
         *,
         extra: Optional[Mapping[str, ValueTypes]] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
     ) -> List[PointCloudObject]:
         raise NotImplementedError()
 
@@ -125,11 +234,17 @@ class PiAiCamera(Vision, EasyResource):
         self,
         *,
         extra: Optional[Mapping[str, ValueTypes]] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
     ) -> Vision.Properties:
-        raise NotImplementedError()
+        properties = Vision.Properties()
+        properties.object_point_clouds_supported = False
+        properties.detections_supported = self.intrinsics.task == "object detection"
+        properties.classifications_supported = self.intrinsics.task == "classification"
+        return properties
+
+    async def close(self):
+        self.picam.stop()
 
 
 if __name__ == "__main__":
     asyncio.run(Module.run_from_registry())
-

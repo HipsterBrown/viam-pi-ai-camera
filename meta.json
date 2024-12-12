@@ -2,8 +2,15 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "hipsterbrown:pi-ai-camera",
   "visibility": "public",
-  "url": "",
+  "url": "https://github.com/hipsterbrown/viam-pi-ai-camera",
   "description": "Modular vision service: pi-ai-camera",
+  "build": {
+    "build": "mise run package",
+    "path": "module.tar.gz",
+    "arch": [
+      "linux/arm64"
+    ]
+  },
   "models": [
     {
       "api": "rdk:service:vision",
