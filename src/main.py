@@ -1,7 +1,7 @@
 import asyncio
 import time
 from functools import lru_cache
-from typing import ClassVar, List, Mapping, Optional, Sequence
+from typing import ClassVar, List, Literal, Mapping, Optional, Sequence
 
 from typing_extensions import Self
 from viam.logging import getLogger
@@ -23,9 +23,50 @@ from picamera2.devices.imx500 import NetworkIntrinsics, postprocess_nanodet_dete
 from picamera2.devices.imx500.imx500 import FW_NETWORK_STAGE
 from picamera2.devices.imx500.postprocess import softmax, scale_boxes
 
+from pydantic import BaseModel, Field
+
 import numpy as np
 
 LOGGER = getLogger(__name__)
+
+
+class VisionConfig(BaseModel):
+    task: Literal["classification", "object detection"] = "classification"
+    model: Literal[
+        "efficientdet_lite0_pp",
+        "efficientnet_bo",
+        "efficientnet_lite0",
+        "efficientnetv2_b0",
+        "efficientnetv2_b1",
+        "efficientnetv2_b2",
+        "higherhrnet_coco",
+        "levit_128s",
+        "mnasnet1.0",
+        "mobilenet_v2",
+        "mobilevit_xs",
+        "mobilevit_xxs",
+        "nanodet_plus_416x416_pp",
+        "nanodet_plus_416x416",
+        "regnetx_002",
+        "regnety_002",
+        "regnety_004",
+        "resnet18",
+        "shufflenet_v2_x1_5",
+        "squeezenet1.0",
+        "ssd_mobilenetv2_fpnlite_320x320_pp",
+    ] = Field(
+        default_factory=lambda data: (
+            "mobilenet_v2"
+            if data["task"] == "classification"
+            else "ssd_mobilenetv2_fpnlite_320x320_pp"
+        )
+    )
+    postprocess: Optional[Literal["softmax", "nanodet"]] = None
+    labels_path: str = Field(
+        default_factory=lambda data: f"assets/{'imagenet_labels' if data['task'] == 'classification' else 'coco_labels'}.txt"
+    )
+    inference_rate: int = Field(ge=0, default=30)
+    default_minimum_confidence: float = Field(le=1.0, ge=0.0, default=0.55)
 
 
 class PiAiCamera(Vision, EasyResource):
@@ -63,6 +104,7 @@ class PiAiCamera(Vision, EasyResource):
         Returns:
             Sequence[str]: A list of implicit dependencies
         """
+        VisionConfig(**struct_to_dict(config.attributes))
         return []
 
     def reconfigure(
@@ -74,36 +116,24 @@ class PiAiCamera(Vision, EasyResource):
             config (ComponentConfig): The new configuration
             dependencies (Mapping[ResourceName, ResourceBase]): Any dependencies (both implicit and explicit)
         """
-        attrs = struct_to_dict(config.attributes)
-        task = str(attrs.get("task", "classification"))
-        model = attrs.get(
-            "model_path",
-            f"/usr/share/imx500-models/{'imx500_network_mobilenet_v2.rpk' if task == 'classification' else 'imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk'}",
-        )
-        inference_rate = attrs.get("inference_rate", 30)
-        postprocess = attrs.get("postprocess", None)
-        self.labels_path = str(
-            attrs.get(
-                "labels_path",
-                f"assets/{'imagenet_labels' if task == 'classification' else 'coco_labels'}.txt",
-            )
-        )
+        self.config = VisionConfig(**struct_to_dict(config.attributes))
 
         if self.picam is not None:
             LOGGER.info("Stopping existing camera")
             self.picam.close()
 
         LOGGER.info("Creating IMX500 instance")
-        self.imx500 = IMX500(model)
+        model_path = f"/usr/share/imx500-models/imx500_network_{self.config.model}.rpk"
+        self.imx500 = IMX500(model_path)
         self.intrinsics = self.imx500.network_intrinsics or NetworkIntrinsics()
-        self.intrinsics.task = task
-        if postprocess == "softmax":
+        self.intrinsics.task = self.config.task
+        if self.config.postprocess == "softmax":
             self.intrinsics.softmax = True
-        if postprocess == "nanodet":
-            self.intrinsics.postprocess = postprocess
-        self.intrinsics.inference_rate = inference_rate
+        if self.config.postprocess == "nanodet":
+            self.intrinsics.postprocess = self.config.postprocess
+        self.intrinsics.inference_rate = self.config.inference_rate
 
-        with open(self.labels_path, "r") as f:
+        with open(self.config.labels_path, "r") as f:
             self.intrinsics.labels = f.read().splitlines()
 
         self.intrinsics.update_with_defaults()
@@ -154,7 +184,7 @@ class PiAiCamera(Vision, EasyResource):
 
             if return_classifications and properties.classifications_supported:
                 result.classifications = self._parse_classifications_from_request(
-                    capture_request, 5
+                    capture_request, 10
                 )
 
             return result
@@ -163,6 +193,7 @@ class PiAiCamera(Vision, EasyResource):
         self, request: CompletedRequest
     ) -> List[Detection]:
         metadata = request.get_metadata()
+        confidence = self.config.default_minimum_confidence
         np_outputs = self.imx500.get_outputs(metadata, add_batch=True)
         input_w, input_h = self.imx500.get_input_size()
         if np_outputs is None:
@@ -170,7 +201,7 @@ class PiAiCamera(Vision, EasyResource):
 
         if self.intrinsics.postprocess == "nanodet":
             boxes, scores, classes = postprocess_nanodet_detection(
-                outputs=np_outputs[0], max_out=10
+                outputs=np_outputs[0], conf=confidence, max_out_dets=10
             )[0]
             boxes = scale_boxes(boxes, 1, 1, input_h, input_w, False, False)
         else:
@@ -194,19 +225,21 @@ class PiAiCamera(Vision, EasyResource):
         ]
         return [
             Detection(
-                x_min=box[0],
-                y_min=box[1],
-                x_max=box[2],
-                y_max=box[3],
+                x_min=int(box[1]),
+                y_min=int(box[0]),
+                x_max=int(box[3]),
+                y_max=int(box[2]),
                 confidence=score,
                 class_name=self._get_label_for_index(int(class_idx)),
             )
             for box, score, class_idx in zip(boxes, scores, classes)
+            if score >= confidence
         ]
 
     def _parse_classifications_from_request(
         self, request: CompletedRequest, count: int = 3
     ) -> List[Classification]:
+        confidence = self.config.default_minimum_confidence
         np_outputs = self.imx500.get_outputs(request.get_metadata())
         if np_outputs is None:
             return []
@@ -223,10 +256,11 @@ class PiAiCamera(Vision, EasyResource):
                 confidence=np_output[index],
             )
             for index in top_indices
+            if np_output[index] >= confidence
         ]
 
     def _get_label_for_index(self, index: int) -> str:
-        labels = self._get_labels(self.labels_path)
+        labels = self._get_labels(self.config.labels_path)
         return labels[index]
 
     @lru_cache
