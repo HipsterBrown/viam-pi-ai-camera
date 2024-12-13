@@ -82,7 +82,7 @@ class PiAiCamera(Vision, EasyResource):
         )
         inference_rate = attrs.get("inference_rate", 30)
         postprocess = attrs.get("postprocess", None)
-        labels = str(
+        self.labels_path = str(
             attrs.get(
                 "labels_path",
                 f"assets/{'imagenet_labels' if task == 'classification' else 'coco_labels'}.txt",
@@ -90,8 +90,10 @@ class PiAiCamera(Vision, EasyResource):
         )
 
         if self.picam is not None:
-            self.picam.stop()
+            LOGGER.info("Stopping existing camera")
+            self.picam.close()
 
+        LOGGER.info("Creating IMX500 instance")
         self.imx500 = IMX500(model)
         self.intrinsics = self.imx500.network_intrinsics or NetworkIntrinsics()
         self.intrinsics.task = task
@@ -101,16 +103,18 @@ class PiAiCamera(Vision, EasyResource):
             self.intrinsics.postprocess = postprocess
         self.intrinsics.inference_rate = inference_rate
 
-        with open(labels, "r") as f:
+        with open(self.labels_path, "r") as f:
             self.intrinsics.labels = f.read().splitlines()
 
         self.intrinsics.update_with_defaults()
 
+        LOGGER.info("Creating Picamera2 instance")
         self.picam = Picamera2(self.imx500.camera_num)
-        cam_config = self.picam.create_still_configuration(buffer_count=2)
+        cam_config = self.picam.create_still_configuration(buffer_count=4)
         self.picam.start(cam_config)
 
         if self.intrinsics.preserve_aspect_ratio:
+            LOGGER.info("Preserving aspect ratio")
             self.imx500.set_auto_aspect_ratio()
 
         LOGGER.info("Waiting on camera firmware upload to complete")
@@ -139,22 +143,21 @@ class PiAiCamera(Vision, EasyResource):
         )
         properties = await self.get_properties()
         result = CaptureAllResult()
-        capture_request: CompletedRequest = self.picam.capture_request()
-        if return_image:
-            result.image = pil_to_viam_image(
-                capture_request.make_image("main"), CameraMimeType.JPEG
-            )
+        with self.picam.captured_request() as capture_request:
+            if return_image:
+                result.image = pil_to_viam_image(
+                    capture_request.make_image("main"), CameraMimeType.JPEG
+                )
 
-        if return_detections and properties.detections_supported:
-            result.detections = self._parse_detections_from_request(capture_request)
+            if return_detections and properties.detections_supported:
+                result.detections = self._parse_detections_from_request(capture_request)
 
-        if return_classifications and properties.classifications_supported:
-            result.classifications = self._parse_classifications_from_request(
-                capture_request, 1
-            )
-        capture_request.release()
+            if return_classifications and properties.classifications_supported:
+                result.classifications = self._parse_classifications_from_request(
+                    capture_request, 5
+                )
 
-        return result
+            return result
 
     def _parse_detections_from_request(
         self, request: CompletedRequest
@@ -223,11 +226,12 @@ class PiAiCamera(Vision, EasyResource):
         ]
 
     def _get_label_for_index(self, index: int) -> str:
-        labels = self._get_labels()
+        labels = self._get_labels(self.labels_path)
         return labels[index]
 
     @lru_cache
-    def _get_labels(self) -> List[str]:
+    def _get_labels(self, _labels_path: str) -> List[str]:
+        """labels_path is used to break the cache if the configuration changes"""
         labels = self.intrinsics.labels
 
         if self.intrinsics.ignore_dash_labels:
@@ -243,10 +247,9 @@ class PiAiCamera(Vision, EasyResource):
         timeout: Optional[float] = None,
     ) -> List[Detection]:
         if self.intrinsics.task == "object detection":
-            capture_request = self.picam.capture_request()
-            detections = self._parse_detections_from_request(capture_request)
-            capture_request.release()
-            return detections
+            with self.picam.captured_request() as capture_request:
+                detections = self._parse_detections_from_request(capture_request)
+                return detections
         raise NotImplementedError()
 
     async def get_detections(
@@ -267,12 +270,11 @@ class PiAiCamera(Vision, EasyResource):
         timeout: Optional[float] = None,
     ) -> List[Classification]:
         if self.intrinsics.task == "classification":
-            capture_request = self.picam.capture_request()
-            classifications = self._parse_classifications_from_request(
-                capture_request, count
-            )
-            capture_request.release()
-            return classifications
+            with self.picam.captured_request() as capture_request:
+                classifications = self._parse_classifications_from_request(
+                    capture_request, count
+                )
+                return classifications
         raise NotImplementedError()
 
     async def get_classifications(
@@ -307,7 +309,8 @@ class PiAiCamera(Vision, EasyResource):
         return properties
 
     async def close(self):
-        self.picam.stop()
+        LOGGER.info("Closing camera instance")
+        self.picam.close()
 
 
 if __name__ == "__main__":
