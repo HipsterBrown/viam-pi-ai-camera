@@ -31,6 +31,7 @@ The following attributes are available for `hipsterbrown:vision:pi-ai-camera` vi
 | `postprocess` | "softmax" or "nanodet" | Optional | - | What kind of post processing step should be taken on the ML output from the camera: [softmax](https://en.wikipedia.org/wiki/Softmax_function) is used with classification tasks |
 | `inference_rate` | number | Optional | 30 | The number of frames per second to process images against the configured ML model |
 | `default_minimum_confidence` | number | Optional | 0.55 | Number between 0 and 1 as a minimum percentage of confidence for the returned outputs from the model |
+| `buffer_count` | number | Optional | 4 | The amount of queued images in the camera to prevent blocking processing new images. |
 
 _* This value must be one of the included pre-compiled models, see more below._
 

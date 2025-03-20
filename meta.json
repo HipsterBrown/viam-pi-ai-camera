@@ -14,7 +14,9 @@
   "models": [
     {
       "api": "rdk:service:vision",
-      "model": "hipsterbrown:vision:pi-ai-camera"
+      "model": "hipsterbrown:vision:pi-ai-camera",
+      "short_description": "Run computer vision tasks directly on the Raspberry Pi AI camera.",
+      "markdown_link": "README.md#configure-your-pi-ai-camera-vision-service"
     }
   ],
   "entrypoint": "./run.sh",

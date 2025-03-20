@@ -1,4 +1,5 @@
 import asyncio
+import sys
 import time
 from functools import lru_cache
 from typing import ClassVar, List, Literal, Mapping, Optional, Sequence
@@ -67,6 +68,7 @@ class VisionConfig(BaseModel):
     )
     inference_rate: int = Field(ge=0, default=30)
     default_minimum_confidence: float = Field(le=1.0, ge=0.0, default=0.55)
+    buffer_count: int = Field(ge=1, default=1)
 
 
 class PiAiCamera(Vision, EasyResource):
@@ -119,10 +121,10 @@ class PiAiCamera(Vision, EasyResource):
         self.config = VisionConfig(**struct_to_dict(config.attributes))
 
         if self.picam is not None:
-            LOGGER.info("Stopping existing camera")
+            LOGGER.debug("Stopping existing camera")
             self.picam.close()
 
-        LOGGER.info("Creating IMX500 instance")
+        LOGGER.debug("Creating IMX500 instance")
         model_path = f"/usr/share/imx500-models/imx500_network_{self.config.model}.rpk"
         self.imx500 = IMX500(model_path)
         self.intrinsics = self.imx500.network_intrinsics or NetworkIntrinsics()
@@ -132,28 +134,33 @@ class PiAiCamera(Vision, EasyResource):
         if self.config.postprocess == "nanodet":
             self.intrinsics.postprocess = self.config.postprocess
         self.intrinsics.inference_rate = self.config.inference_rate
+        self.intrinsics.bbox_order = "yx"
 
         with open(self.config.labels_path, "r") as f:
             self.intrinsics.labels = f.read().splitlines()
 
         self.intrinsics.update_with_defaults()
 
-        LOGGER.info("Creating Picamera2 instance")
+        LOGGER.debug("Creating Picamera2 instance")
+        Picamera2.set_logging(level=Picamera2.DEBUG, output=sys.stdout)
         self.picam = Picamera2(self.imx500.camera_num)
-        cam_config = self.picam.create_still_configuration(buffer_count=4)
+        cam_config = self.picam.create_still_configuration(
+            buffer_count=self.config.buffer_count,
+            main={"size": (2028, 1520)},
+        )
         self.picam.start(cam_config)
 
         if self.intrinsics.preserve_aspect_ratio:
-            LOGGER.info("Preserving aspect ratio")
+            LOGGER.debug("Preserving aspect ratio")
             self.imx500.set_auto_aspect_ratio()
 
-        LOGGER.info("Waiting on camera firmware upload to complete")
+        LOGGER.debug("Waiting on camera firmware upload to complete")
         while True:
             current, total = self.imx500.get_fw_upload_progress(FW_NETWORK_STAGE)
             if total:
-                LOGGER.info(f"{current} out of {total} bytes uploaded to camera")
+                LOGGER.debug(f"{current} out of {total} bytes uploaded to camera")
                 if current > 0.95 * total:
-                    LOGGER.info("Firmware upload complete!")
+                    LOGGER.debug("Firmware upload complete!")
                     break
             time.sleep(0.5)
 
@@ -168,15 +175,16 @@ class PiAiCamera(Vision, EasyResource):
         extra: Optional[Mapping[str, ValueTypes]] = None,
         timeout: Optional[float] = None,
     ) -> CaptureAllResult:
-        LOGGER.info(
-            f"Processing capture request for {camera_name} with arguments: return_image ({return_image}), return_classifications ({return_classifications}), return_detections ({ return_detections})"
+        LOGGER.debug(
+            f"Processing capture request for {camera_name} with arguments: return_image ({return_image}), return_classifications ({return_classifications}), return_detections ({return_detections})"
         )
         properties = await self.get_properties()
         result = CaptureAllResult()
         with self.picam.captured_request() as capture_request:
             if return_image:
                 result.image = pil_to_viam_image(
-                    capture_request.make_image("main"), CameraMimeType.JPEG
+                    capture_request.make_image("main"),
+                    CameraMimeType.JPEG,
                 )
 
             if return_detections and properties.detections_supported:
@@ -195,10 +203,10 @@ class PiAiCamera(Vision, EasyResource):
         metadata = request.get_metadata()
         confidence = self.config.default_minimum_confidence
         np_outputs = self.imx500.get_outputs(metadata, add_batch=True)
-        input_w, input_h = self.imx500.get_input_size()
         if np_outputs is None:
             return []
 
+        input_w, input_h = self.imx500.get_input_size()
         if self.intrinsics.postprocess == "nanodet":
             boxes, scores, classes = postprocess_nanodet_detection(
                 outputs=np_outputs[0], conf=confidence, max_out_dets=10
@@ -225,10 +233,10 @@ class PiAiCamera(Vision, EasyResource):
         ]
         return [
             Detection(
-                x_min=int(box[1]),
-                y_min=int(box[0]),
-                x_max=int(box[3]),
-                y_max=int(box[2]),
+                x_min=int(box[0]),
+                y_min=int(box[1]),
+                x_max=int(box[2]),
+                y_max=int(box[3]),
                 confidence=score,
                 class_name=self._get_label_for_index(int(class_idx)),
             )
@@ -242,6 +250,7 @@ class PiAiCamera(Vision, EasyResource):
         confidence = self.config.default_minimum_confidence
         np_outputs = self.imx500.get_outputs(request.get_metadata())
         if np_outputs is None:
+            LOGGER.debug("No outputs for classificiation")
             return []
 
         np_output = np_outputs[0]
@@ -250,6 +259,7 @@ class PiAiCamera(Vision, EasyResource):
 
         top_indices = np.argpartition(-np_output, count)[:count]
         top_indices = top_indices[np.argsort(-np_output[top_indices])]
+        LOGGER.debug(f"Found a number of classifications: {len(top_indices)}")
         return [
             Classification(
                 class_name=self._get_label_for_index(int(index)),
@@ -343,7 +353,7 @@ class PiAiCamera(Vision, EasyResource):
         return properties
 
     async def close(self):
-        LOGGER.info("Closing camera instance")
+        LOGGER.debug("Closing camera instance")
         self.picam.close()
 
 

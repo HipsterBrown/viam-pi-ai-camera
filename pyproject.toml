@@ -1,13 +1,13 @@
 [project]
 name = "viam-pi-ai-camera"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "A modular resource for Viam machines to enable using the Raspberry Pi AI camera for computer vision tasks"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.10.3",
     "typing-extensions>=4.12.2",
-    "viam-sdk==0.35.0",
+    "viam-sdk==0.43.0",
 ]
 
 [dependency-groups]
