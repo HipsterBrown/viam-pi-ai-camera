@@ -142,7 +142,7 @@ class PiAiCamera(Vision, EasyResource):
         self.intrinsics.update_with_defaults()
 
         LOGGER.debug("Creating Picamera2 instance")
-        Picamera2.set_logging(level=Picamera2.DEBUG, output=sys.stdout)
+        Picamera2.set_logging(level=Picamera2.WARN, output=sys.stdout)
         self.picam = Picamera2(self.imx500.camera_num)
         cam_config = self.picam.create_still_configuration(
             buffer_count=self.config.buffer_count,

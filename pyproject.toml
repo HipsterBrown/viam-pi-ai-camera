@@ -1,6 +1,6 @@
 [project]
 name = "viam-pi-ai-camera"
-version = "0.2.0"
+version = "0.2.1"
 description = "A modular resource for Viam machines to enable using the Raspberry Pi AI camera for computer vision tasks"
 readme = "README.md"
 requires-python = ">=3.11"
