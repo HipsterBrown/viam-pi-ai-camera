@@ -142,7 +142,7 @@ class PiAiCamera(Vision, EasyResource):
         self.intrinsics.update_with_defaults()
 
         LOGGER.debug("Creating Picamera2 instance")
-        Picamera2.set_logging(level=Picamera2.WARN, output=sys.stdout)
+        Picamera2.set_logging(level=Picamera2.WARNING, output=sys.stdout)
         self.picam = Picamera2(self.imx500.camera_num)
         cam_config = self.picam.create_still_configuration(
             buffer_count=self.config.buffer_count,
@@ -207,6 +207,7 @@ class PiAiCamera(Vision, EasyResource):
             return []
 
         input_w, input_h = self.imx500.get_input_size()
+        image_w, image_h = self.picam.camera_configuration()["main"]["size"]
         if self.intrinsics.postprocess == "nanodet":
             boxes, scores, classes = postprocess_nanodet_detection(
                 outputs=np_outputs[0], conf=confidence, max_out_dets=10
@@ -224,19 +225,16 @@ class PiAiCamera(Vision, EasyResource):
             if self.intrinsics.bbox_order == "xy":
                 boxes = boxes[:, [1, 0, 3, 2]]
 
+            boxes = scale_boxes(boxes, image_h, image_w, input_h, input_w, True)
             boxes = np.array_split(boxes, 4, axis=1)
             boxes = zip(*boxes)
 
-        boxes = [
-            self.imx500.convert_inference_coords(box, metadata, self.picam)
-            for box in boxes
-        ]
         return [
             Detection(
-                x_min=int(box[0]),
-                y_min=int(box[1]),
-                x_max=int(box[2]),
-                y_max=int(box[3]),
+                x_min=int(box[1]),
+                y_min=int(box[0]),
+                x_max=int(box[3]),
+                y_max=int(box[2]),
                 confidence=score,
                 class_name=self._get_label_for_index(int(class_idx)),
             )
